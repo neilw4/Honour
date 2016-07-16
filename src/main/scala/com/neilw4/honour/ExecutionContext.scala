@@ -5,37 +5,49 @@ import scala.collection.{immutable, mutable}
 import scala.concurrent.ExecutionContext
 import scala.util.control.NonFatal
 
-trait throwError extends ExecutionContext {
+/** Execution context mixin that immediately throws any errors reported. */
+trait ThrowError extends ExecutionContext {
   override def reportFailure(cause: Throwable): Unit = throw cause
 }
 
-trait ignoreError extends ExecutionContext {
+/** Execution context mixin that ignores all errors. */
+trait IgnoreError extends ExecutionContext {
   override def reportFailure(cause: Throwable): Unit = {}
 }
 
+/** Execution context mixin that executes runnables immediately. */
 trait ImmediateExecutor extends ExecutionContext {
   override def execute(runnable: Runnable): Unit = runnable.run()
 }
 
-private trait EventLoopExecutor extends ExecutionContext {
+/** Execution context mixin that executes runnables in an event loop. */
+trait EventLoopExecutor extends ExecutionContext {
   def finish(): Unit = {}
 }
 
+/** Execution context mixin that executes runnables in an event loop. */
 trait EventLoop extends EventLoopExecutor {
 
+  private var running = false
   private val queue = new mutable.Queue[Runnable]
 
-  def apply(): Unit = {
+  def apply(): Unit = if (!running) {
+    running = true
     while (queue.nonEmpty) {
       try {
         queue.dequeue().run()
       } catch { case NonFatal(e) => reportFailure(e) }
     }
+    running = false
   }
 
-  override def execute(runnable: Runnable): Unit = queue.enqueue(runnable)
+  override def execute(runnable: Runnable): Unit = {
+    queue.enqueue(runnable)
+    this()
+  }
 }
 
+/** Execution context mixin that throws any encountered errors once the event loop has finished. */
 trait ThrowAtEnd extends EventLoopExecutor {
   private val errors = new mutable.Queue[Throwable]
 
@@ -43,10 +55,10 @@ trait ThrowAtEnd extends EventLoopExecutor {
 
   override def finish() =
     if (this.errors.nonEmpty)
-      throw new CompositeThrowable(
-          new immutable.HashSet[Throwable]() ++ errors)
+      throw new CompositeThrowable(immutable.Set(errors: _*))
 }
 
+/** Execution context mixin that logs any encountered errors. */
 case class LogError(executor: ExecutionContext) extends ExecutionContext {
 
   override def execute(runnable: Runnable) = executor.execute(runnable)

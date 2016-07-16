@@ -3,52 +3,48 @@ package com.neilw4.honour
 import scala.collection.mutable
 import scala.concurrent._
 import scala.concurrent.duration.Duration
-//import scala.concurrent.ExecutionContext.Implicits.global
 import scala.language.higherKinds
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success, Try}
 import scalaz.MonadError
 
-object Implicits {
-
-  /** Used to decide how to execute callbacks. */
-  implicit val executionContext = new LogError(new EventLoop with ThrowAtEnd)
-}
-
-import Implicits._
-
 object Promise {
 
   /** Creates a promise that succeeds immediately with the given value. */
-  def succeed[T](t: T) = Promise[T]((success, _) => success(t))
+  def succeed[T](t: T) =
+    Promise[T]((success, _) => success(t))(
+        new ImmediateExecutor with ThrowError)
 
   /** Creates a promise that fails immediately with the given value. */
-  def fail[T](e: Throwable) = Promise[T]((_, fail) => fail(e))
+  def fail[T](e: Throwable) =
+    Promise[T]((_, fail) => fail(e))(new ImmediateExecutor with ThrowError)
 }
 
 object PromiseMonad extends MonadError[Promise, Throwable] {
+  override def map[A, B](fa: Promise[A])(f: (A) => B): Promise[B] = fa.map(f)
 
-  /** Creates a promise that fails immediately with the given value. */
-  override def raiseError[T](e: Throwable): Promise[T] = Promise.fail(e)
+  override def ap[A, B](fa: => Promise[A])(
+      f: => Promise[(A) => B]): Promise[B] = fa.ap(f)
 
-  /** If p fails then function f handles the failure. */
-  override def handleError[T](p: Promise[T])(
-      f: Throwable => Promise[T]): Promise[T] = p.bindErrback(f)
+  override def point[A](a: => A): Promise[A] = Promise.succeed(a)
 
-  /** If p succeeds then function f handles the value. */
-  override def bind[T, U](p: Promise[T])(f: T => Promise[U]): Promise[U] =
-    p.bind(f)
+  override def bind[A, B](fa: Promise[A])(f: (A) => Promise[B]): Promise[B] =
+    fa.bind(f)
 
-  /** Creates a promise that succeeds immediately with the given value. */
-  override def point[T](t: => T): Promise[T] = Promise.succeed(t)
+  override def raiseError[A](e: Throwable): Promise[A] = Promise.fail(e)
+
+  override def handleError[A](fa: Promise[A])(
+      f: (Throwable) => Promise[A]): Promise[A] = fa.bindErrback(f)
 }
 
 /**
   * Represents a computation which may or may not have finished and may cause an error.
+  *
   * @param init starts the computation. This function is given two parameters, success and fail,
   *             one of which must be called when the computation finishes to indicate the result.
+  *             It is an error to call success or fail together or mor ethan once.
   */
-final case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
+case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     implicit executor: ExecutionContext)
     extends Future[T] {
 
@@ -103,41 +99,85 @@ final case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
   }
 
   /** @return a promise with the result of p if the computation succeeds. */
-  def append[U](p: Promise[U]) = bind[U](_ => p)
+  def append[U](p: => Promise[U]): Promise[U] = //bind[U](_ => p)
+    Promise[U]((succeed, fail) => {
+      add(_ => p.add(u => succeed(u)))
+      addErrback(fail)
+    })
 
   /** @return a promise with the result of p if the computation fails. */
-  def appendErrback(p: Promise[T]) = bindErrback(_ => p)
+  def appendErrback(p: => Promise[T]) = //bindErrback(_ => p)
+    Promise[T]((succeed, fail) => {
+      add(succeed)
+      addErrback(e => p.addErrback(fail))
+    })
 
-  def apply[U](p: Promise[T => U]) = bind(t => p.map(f => f(t)))
+  def ap[U](p: => Promise[T => U]) = //bind(t => p.map(f => f(t)))
+    Promise[U]((succeed, fail) => {
+      add(t => {
+        p.add(f => succeed(f(t)))
+        p.addErrback(e => fail(e))
+      })
+      addErrback(fail)
+    })
 
-  def applyErrback(p: Promise[Throwable => Throwable]) =
-    bindErrback(e => p.bind(f => Promise.fail(f(e))))
+  def apErrback(p: => Promise[Throwable => Throwable]) =
+    //bindErrback(e => p.bind(f => Promise.fail(f(e))))
+    Promise[T]((succeed, fail) => {
+      add(succeed)
+      addErrback(e => {
+        p.add(f => fail(f(e)))
+        p.addErrback(e2 => fail(e2))
+      })
+    })
 
   /**
     * @param f function to be called if the computation succeeds.
     * @return a promise that will complete once f has been called. Fails if f fails.
     */
-  def then(f: T => Unit): Promise[T] = map(t => { f(t); t })
+  def then(f: T => Unit): Promise[T] = //map(t => { f(t); t })
+    Promise[T]((succeed, fail) => {
+      add(t => {
+        f(t)
+        succeed(t)
+      })
+      addErrback(fail)
+    })
 
   /**
     * @param f function to be called if the computation fails.
     * @return a promise that will complete once f has been called.
     */
   def thenErrback(f: Throwable => Unit): Promise[T] =
-    mapErrback(e => { f(e); e })
+//    mapErrback(e => { f(e); e })
+    Promise[T]((succeed, fail) => {
+      add(succeed)
+      addErrback(e => {
+        f(e)
+        fail(e)
+      })
+    })
 
   /**
     * @param f function to be called to transform the result of a computation if it succeeds.
     * @return a promise that succeeds with the output of f once it has been called. Fails if f fails.
     */
-  def map[U](f: T => U): Promise[U] = bind(f.andThen(Promise.succeed))
+  def map[U](f: T => U): Promise[U] = //bind(f.andThen(Promise.succeed))
+    Promise[U]((succeed, fail) => {
+      add(t => succeed(f(t)))
+      addErrback(fail)
+    })
 
   /**
     * @param f function to be called to transform the failure result of a computation if it fails.
     * @return a promise that fails with the output of f.
     */
   def mapErrback(f: Throwable => Throwable): Promise[T] =
-    bindErrback(f.andThen(Promise.fail))
+//    bindErrback(f.andThen(Promise.fail))
+    Promise[T]((succeed, fail) => {
+      add(succeed)
+      addErrback(e => fail(f(e)))
+    })
 
   /**
     * @param f function to be called to transform the result of a computation if it succeeds.
@@ -185,23 +225,25 @@ final case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     * @return the result of the computation, blocking until the computation ends.
     */
   override def result(atMost: Duration)(implicit permit: CanAwait): T =
-    ??? //TODO(neilw4)
+    ready(atMost).value match {
+      case Some(Success(t)) => t
+      case Some(Failure(e)) => throw e
+      case None =>
+        throw new Exception("timed out waiting for promise to finish")
+    }
 
   /**
     * @param atMost fail if we have to wait longer than this for the computation to finish.
     * @return a promise that fails if the computation takes too long.
     */
   override def ready(atMost: Duration)(
-      implicit permit: CanAwait): Promise.this.type =
-    Promise[T]((succeed, fail) => {
-      var succeeded = false
-      this.add(t => { succeed(t); succeeded = true })
-      this.addErrback(e => fail(e))
+      implicit permit: CanAwait): Promise.this.type = {
+    if (this.value.isEmpty) {
+      //TOD(neilw4) wake up
       Thread.sleep(atMost.length)
-      if (!succeeded) {
-        fail(new Exception("timed out"))
-      }
-    })
+    }
+    this
+  }
 
   /** Computation has succeeded. This should only be called once. */
   private def succeed(t: T): Unit = {
@@ -232,6 +274,3 @@ final case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     }
   }
 }
-
-def async[T](f: () => T): Promise[T] = Promise((succeed, fail) => try {succeed(f())} catch {case NonFatal(e) => fail(e)})
-def await[T](p: Promise[T]) = p.result(Duration.Inf);

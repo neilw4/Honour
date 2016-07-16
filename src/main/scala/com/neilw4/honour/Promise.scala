@@ -20,7 +20,9 @@ object Promise {
     Promise[T]((_, fail) => fail(e))(new ImmediateExecutor with ThrowError)
 }
 
-object PromiseMonad extends MonadError[Promise, Throwable] {
+object PromiseMonad extends MonadError[MonadErrorPromise, Throwable] {
+  implicit val executor = new ImmediateExecutor with ThrowError
+
   override def map[A, B](fa: Promise[A])(f: (A) => B): Promise[B] = fa.map(f)
 
   override def ap[A, B](fa: => Promise[A])(
@@ -42,7 +44,7 @@ object PromiseMonad extends MonadError[Promise, Throwable] {
   *
   * @param init starts the computation. This function is given two parameters, success and fail,
   *             one of which must be called when the computation finishes to indicate the result.
-  *             It is an error to call success or fail together or mor ethan once.
+  *             It is an error to call both success and fail or to call them more than once.
   */
 case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     implicit executor: ExecutionContext)

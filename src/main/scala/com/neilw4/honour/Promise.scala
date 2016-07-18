@@ -10,17 +10,17 @@ import scalaz.MonadError
 
 object Promise {
 
+  def from[T](v: Try[T])(implicit executor: ExecutionContext) = Promise[T]((succeed, fail) => if (v.isSuccess) {succeed(v.get)} else {fail(v.failed.get)})
+
   /** Creates a promise that succeeds immediately with the given value. */
-  def succeed[T](t: T) =
-    Promise[T]((success, _) => success(t))(
-        new ImmediateExecutor with ThrowError)
+  def succeed[T](t: T)(implicit executor: ExecutionContext) =
+    Promise[T]((succeed, _) => succeed(t))
 
   /** Creates a promise that fails immediately with the given value. */
-  def fail[T](e: Throwable) =
-    Promise[T]((_, fail) => fail(e))(new ImmediateExecutor with ThrowError)
+  def fail[T](e: Throwable)(implicit executor: ExecutionContext) =
+    Promise[T]((_, fail) => fail(e))
 }
-
-object PromiseMonad extends MonadError[MonadErrorPromise, Throwable] {
+object PromiseMonad extends MonadError[Promise, Throwable] {
   implicit val executor = new ImmediateExecutor with ThrowError
 
   override def map[A, B](fa: Promise[A])(f: (A) => B): Promise[B] = fa.map(f)
@@ -42,9 +42,9 @@ object PromiseMonad extends MonadError[MonadErrorPromise, Throwable] {
 /**
   * Represents a computation which may or may not have finished and may cause an error.
   *
-  * @param init starts the computation. This function is given two parameters, success and fail,
+  * @param init starts the computation. This function is given two parameters, succeed and fail,
   *             one of which must be called when the computation finishes to indicate the result.
-  *             It is an error to call both success and fail or to call them more than once.
+  *             It is an error to call both succeed and fail or to call them more than once.
   */
 case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     implicit executor: ExecutionContext)
@@ -226,22 +226,24 @@ case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     * @param atMost fail if we have to wait longer than this for the computation to finish.
     * @return the result of the computation, blocking until the computation ends.
     */
+  @scala.throws[Exception](classOf[Exception])
   override def result(atMost: Duration)(implicit permit: CanAwait): T =
     ready(atMost).value match {
       case Some(Success(t)) => t
       case Some(Failure(e)) => throw e
-      case None =>
-        throw new Exception("timed out waiting for promise to finish")
+      case None => throw new TimeoutException()
     }
 
   /**
     * @param atMost fail if we have to wait longer than this for the computation to finish.
     * @return a promise that fails if the computation takes too long.
     */
+  @scala.throws[InterruptedException](classOf[InterruptedException])
+  @scala.throws[TimeoutException](classOf[TimeoutException])
   override def ready(atMost: Duration)(
       implicit permit: CanAwait): Promise.this.type = {
     if (this.value.isEmpty) {
-      //TOD(neilw4) wake up
+      //TODO(neilw4) wake up
       Thread.sleep(atMost.length)
     }
     this
@@ -276,3 +278,17 @@ case class Promise[T](init: ((T => Unit, Throwable => Unit) => Unit))(
     }
   }
 }
+
+
+class BaseDeferred[T](d: Deferred[T])(implicit executor: ExecutionContext) extends Promise[T]((succeed, fail) => d.set(succeed, fail)) {
+
+  var succeed: T => Unit = (_) => throw new Exception("not initialised yet")
+  var fail: Throwable => Unit = (_) => throw new Exception("not initialised yet")
+
+  def set(succeed: T => Unit, fail: Throwable => Unit) = {
+    this.succeed = succeed
+    this.fail = fail
+  }
+}
+
+class Deferred[T] extends BaseDeferred[T](this)(new ImmediateExecutor with ThrowError)

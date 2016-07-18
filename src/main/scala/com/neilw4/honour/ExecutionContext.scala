@@ -31,12 +31,16 @@ trait EventLoop extends EventLoopExecutor {
   private var running = false
   private val queue = new mutable.Queue[Runnable]
 
+  def tick() = if (queue.nonEmpty) {
+    try {
+      queue.dequeue().run()
+    } catch { case NonFatal(e) => reportFailure(e) }
+  }
+
   def apply(): Unit = if (!running) {
     running = true
     while (queue.nonEmpty) {
-      try {
-        queue.dequeue().run()
-      } catch { case NonFatal(e) => reportFailure(e) }
+      tick()
     }
     running = false
   }
